@@ -1,0 +1,349 @@
+From 1e206129403ef47da2c9251ce7e78a90bd923dab Mon Sep 17 00:00:00 2001
+From: Haoyu Qiu <timothyqiu32@gmail.com>
+Date: Sat, 20 Apr 2024 12:43:19 +0800
+Subject: [PATCH] Allow setting editor dock tabs to icon only
+
+---
+ doc/classes/EditorPlugin.xml     |  8 ++++
+ doc/classes/EditorSettings.xml   |  3 ++
+ editor/editor_dock_manager.cpp   | 79 +++++++++++++++++++++++++++++---
+ editor/editor_dock_manager.h     | 11 ++++-
+ editor/editor_node.cpp           | 19 +++++---
+ editor/editor_settings.cpp       |  1 +
+ editor/plugins/editor_plugin.cpp |  6 +++
+ editor/plugins/editor_plugin.h   |  2 +
+ 8 files changed, 115 insertions(+), 14 deletions(-)
+
+diff --git a/doc/classes/EditorPlugin.xml b/doc/classes/EditorPlugin.xml
+index e874b44cfc21c..89b9e7d6c295c 100644
+--- a/doc/classes/EditorPlugin.xml
++++ b/doc/classes/EditorPlugin.xml
+@@ -727,6 +727,14 @@
+ 				Removes a callback previously added by [method add_undo_redo_inspector_hook_callback].
+ 			</description>
+ 		</method>
++		<method name="set_dock_tab_icon">
++			<return type="void" />
++			<param index="0" name="control" type="Control" />
++			<param index="1" name="icon" type="Texture2D" />
++			<description>
++				Sets the tab icon for the given control in a dock slot. Setting to [code]null[/code] removes the icon.
++			</description>
++		</method>
+ 		<method name="set_force_draw_over_forwarding_enabled">
+ 			<return type="void" />
+ 			<description>
+diff --git a/doc/classes/EditorSettings.xml b/doc/classes/EditorSettings.xml
+index 93a7b09fce15e..e763040668777 100644
+--- a/doc/classes/EditorSettings.xml
++++ b/doc/classes/EditorSettings.xml
+@@ -635,6 +635,9 @@
+ 			If set to [b]Auto[/b], the editor scale is automatically determined based on the screen resolution and reported display DPI. This heuristic is not always ideal, which means you can get better results by setting the editor scale manually.
+ 			If set to [b]Custom[/b], the scaling value in [member interface/editor/custom_display_scale] will be used.
+ 		</member>
++		<member name="interface/editor/dock_tab_style" type="int" setter="" getter="">
++			Tab style of editor docks.
++		</member>
+ 		<member name="interface/editor/editor_language" type="String" setter="" getter="">
+ 			The language to use for the editor interface.
+ 			Translations are provided by the community. If you spot a mistake, [url=$DOCS_URL/contributing/documentation/editor_and_docs_localization.html]contribute to editor translations on Weblate![/url]
+diff --git a/editor/editor_dock_manager.cpp b/editor/editor_dock_manager.cpp
+index b6250671ee188..ac605a434f374 100644
+--- a/editor/editor_dock_manager.cpp
++++ b/editor/editor_dock_manager.cpp
+@@ -33,12 +33,10 @@
+ #include "scene/gui/box_container.h"
+ #include "scene/gui/button.h"
+ #include "scene/gui/label.h"
+-#include "scene/gui/popup.h"
+ #include "scene/gui/split_container.h"
+ #include "scene/gui/tab_container.h"
+ #include "scene/main/window.h"
+ 
+-#include "editor/editor_command_palette.h"
+ #include "editor/editor_node.h"
+ #include "editor/editor_settings.h"
+ #include "editor/editor_string_names.h"
+@@ -47,6 +45,12 @@
+ #include "editor/themes/editor_scale.h"
+ #include "editor/window_wrapper.h"
+ 
++enum class TabStyle {
++	TEXT_ONLY,
++	ICON_ONLY,
++	TEXT_AND_ICON,
++};
++
+ EditorDockManager *EditorDockManager::singleton = nullptr;
+ 
+ void DockSplitContainer::_update_visibility() {
+@@ -157,7 +161,7 @@ void EditorDockManager::_update_docks_menu() {
+ 	docks_menu->clear();
+ 	docks_menu->reset_size();
+ 
+-	const Ref<Texture2D> icon = docks_menu->get_editor_theme_icon(SNAME("Window"));
++	const Ref<Texture2D> default_icon = docks_menu->get_editor_theme_icon(SNAME("Window"));
+ 	const Color closed_icon_color_mod = Color(1, 1, 1, 0.5);
+ 
+ 	// Add docks.
+@@ -170,7 +174,8 @@ void EditorDockManager::_update_docks_menu() {
+ 		} else {
+ 			docks_menu->add_item(dock.value.title, id);
+ 		}
+-		docks_menu->set_item_icon(id, icon);
++		const Ref<Texture2D> icon = dock.value.icon_name ? docks_menu->get_editor_theme_icon(dock.value.icon_name) : dock.value.icon;
++		docks_menu->set_item_icon(id, icon.is_valid() ? icon : default_icon);
+ 		if (!dock.value.open) {
+ 			docks_menu->set_item_icon_modulate(id, closed_icon_color_mod);
+ 		}
+@@ -345,7 +350,9 @@ void EditorDockManager::_move_dock(Control *p_dock, Control *p_target, int p_tab
+ 	p_target->set_block_signals(false);
+ 	TabContainer *dock_tab_container = Object::cast_to<TabContainer>(p_target);
+ 	if (dock_tab_container) {
+-		dock_tab_container->set_tab_title(dock_tab_container->get_tab_idx_from_control(p_dock), all_docks[p_dock].title);
++		if (dock_tab_container->is_inside_tree()) {
++			_update_tab_style(p_dock);
++		}
+ 		if (p_tab_index >= 0) {
+ 			_move_dock_tab_index(p_dock, p_tab_index, p_set_current);
+ 		}
+@@ -353,6 +360,42 @@ void EditorDockManager::_move_dock(Control *p_dock, Control *p_target, int p_tab
+ 	}
+ }
+ 
++void EditorDockManager::_update_tab_style(Control *p_dock) {
++	const DockInfo &dock_info = all_docks[p_dock];
++	if (!dock_info.enabled || !dock_info.open) {
++		return; // Disabled by feature profile or manually closed by user.
++	}
++	if (dock_info.dock_window || dock_info.at_bottom) {
++		return; // Floating or sent to bottom.
++	}
++
++	TabContainer *tab_container = get_dock_tab_container(p_dock);
++	ERR_FAIL_NULL(tab_container);
++	int index = tab_container->get_tab_idx_from_control(p_dock);
++	ERR_FAIL_COND(index == -1);
++
++	const TabStyle style = (TabStyle)EDITOR_GET("interface/editor/dock_tab_style").operator int();
++	switch (style) {
++		case TabStyle::TEXT_ONLY: {
++			tab_container->set_tab_title(index, dock_info.title);
++			tab_container->set_tab_icon(index, Ref<Texture2D>());
++			tab_container->set_tab_tooltip(index, String());
++		} break;
++		case TabStyle::ICON_ONLY: {
++			const Ref<Texture2D> icon = dock_info.icon_name ? tab_container->get_editor_theme_icon(dock_info.icon_name) : dock_info.icon;
++			tab_container->set_tab_title(index, icon.is_valid() ? String() : dock_info.title);
++			tab_container->set_tab_icon(index, icon);
++			tab_container->set_tab_tooltip(index, icon.is_valid() ? dock_info.title : String());
++		} break;
++		case TabStyle::TEXT_AND_ICON: {
++			const Ref<Texture2D> icon = dock_info.icon_name ? tab_container->get_editor_theme_icon(dock_info.icon_name) : dock_info.icon;
++			tab_container->set_tab_title(index, dock_info.title);
++			tab_container->set_tab_icon(index, icon);
++			tab_container->set_tab_tooltip(index, String());
++		} break;
++	}
++}
++
+ void EditorDockManager::save_docks_to_config(Ref<ConfigFile> p_layout, const String &p_section) const {
+ 	// Save docks by dock slot.
+ 	for (int i = 0; i < DOCK_SLOT_MAX; i++) {
+@@ -666,14 +709,15 @@ void EditorDockManager::focus_dock(Control *p_dock) {
+ 	tab_container->set_current_tab(tab_index);
+ }
+ 
+-void EditorDockManager::add_dock(Control *p_dock, const String &p_title, DockSlot p_slot, const Ref<Shortcut> &p_shortcut) {
++void EditorDockManager::add_dock(Control *p_dock, const String &p_title, DockSlot p_slot, const Ref<Shortcut> &p_shortcut, const StringName &p_icon_name) {
+ 	ERR_FAIL_NULL(p_dock);
+ 	ERR_FAIL_COND_MSG(all_docks.has(p_dock), vformat("Cannot add dock '%s', already added.", p_dock->get_name()));
+ 
+ 	DockInfo dock_info;
+-	dock_info.title = !p_title.is_empty() ? p_title : String(p_dock->get_name());
++	dock_info.title = p_title.is_empty() ? String(p_dock->get_name()) : p_title;
+ 	dock_info.dock_slot_index = p_slot;
+ 	dock_info.shortcut = p_shortcut;
++	dock_info.icon_name = p_icon_name;
+ 	all_docks[p_dock] = dock_info;
+ 
+ 	if (p_slot != DOCK_SLOT_NONE) {
+@@ -696,6 +740,14 @@ void EditorDockManager::remove_dock(Control *p_dock) {
+ 	_update_layout();
+ }
+ 
++void EditorDockManager::set_dock_tab_icon(Control *p_dock, const Ref<Texture2D> &p_icon) {
++	ERR_FAIL_NULL(p_dock);
++	ERR_FAIL_COND_MSG(!all_docks.has(p_dock), vformat("Cannot set tab icon for unknown dock '%s'.", p_dock->get_name()));
++
++	all_docks[p_dock].icon = p_icon;
++	_update_tab_style(p_dock);
++}
++
+ void EditorDockManager::set_docks_visible(bool p_show) {
+ 	if (docks_visible == p_show) {
+ 		return;
+@@ -711,6 +763,19 @@ bool EditorDockManager::are_docks_visible() const {
+ 	return docks_visible;
+ }
+ 
++void EditorDockManager::update_tab_styles() {
++	for (const KeyValue<Control *, DockInfo> &dock : all_docks) {
++		_update_tab_style(dock.key);
++	}
++}
++
++void EditorDockManager::set_tab_icon_max_width(int p_max_width) {
++	for (int i = 0; i < DOCK_SLOT_MAX; i++) {
++		TabContainer *tab_container = dock_slot[i];
++		tab_container->add_theme_constant_override(SNAME("icon_max_width"), p_max_width);
++	}
++}
++
+ void EditorDockManager::add_vsplit(DockSplitContainer *p_split) {
+ 	vsplits.push_back(p_split);
+ 	p_split->connect("dragged", callable_mp(this, &EditorDockManager::_dock_split_dragged));
+diff --git a/editor/editor_dock_manager.h b/editor/editor_dock_manager.h
+index cbb076c809370..226222c55a7c6 100644
+--- a/editor/editor_dock_manager.h
++++ b/editor/editor_dock_manager.h
+@@ -87,6 +87,8 @@ class EditorDockManager : public Object {
+ 		WindowWrapper *dock_window = nullptr;
+ 		int dock_slot_index = DOCK_SLOT_NONE;
+ 		Ref<Shortcut> shortcut;
++		Ref<Texture2D> icon; // Only used when `icon_name` is empty.
++		StringName icon_name;
+ 	};
+ 
+ 	static EditorDockManager *singleton;
+@@ -126,9 +128,14 @@ class EditorDockManager : public Object {
+ 	void _move_dock_tab_index(Control *p_dock, int p_tab_index, bool p_set_current);
+ 	void _move_dock(Control *p_dock, Control *p_target, int p_tab_index = -1, bool p_set_current = true);
+ 
++	void _update_tab_style(Control *p_dock);
++
+ public:
+ 	static EditorDockManager *get_singleton() { return singleton; }
+ 
++	void update_tab_styles();
++	void set_tab_icon_max_width(int p_max_width);
++
+ 	void add_vsplit(DockSplitContainer *p_split);
+ 	void add_hsplit(DockSplitContainer *p_split);
+ 	void register_dock_slot(DockSlot p_dock_slot, TabContainer *p_tab_container);
+@@ -150,9 +157,11 @@ class EditorDockManager : public Object {
+ 	void set_docks_visible(bool p_show);
+ 	bool are_docks_visible() const;
+ 
+-	void add_dock(Control *p_dock, const String &p_title = "", DockSlot p_slot = DOCK_SLOT_NONE, const Ref<Shortcut> &p_shortcut = nullptr);
++	void add_dock(Control *p_dock, const String &p_title = "", DockSlot p_slot = DOCK_SLOT_NONE, const Ref<Shortcut> &p_shortcut = nullptr, const StringName &p_icon_name = StringName());
+ 	void remove_dock(Control *p_dock);
+ 
++	void set_dock_tab_icon(Control *p_dock, const Ref<Texture2D> &p_icon);
++
+ 	EditorDockManager();
+ };
+ 
+diff --git a/editor/editor_node.cpp b/editor/editor_node.cpp
+index b9ac7b6d4269f..ec7d97c3e02b4 100644
+--- a/editor/editor_node.cpp
++++ b/editor/editor_node.cpp
+@@ -544,6 +544,9 @@ void EditorNode::_update_theme(bool p_skip_creation) {
+ 			}
+ 		}
+ 	}
++
++	editor_dock_manager->update_tab_styles();
++	editor_dock_manager->set_tab_icon_max_width(theme->get_constant(SNAME("class_icon_size"), EditorStringName(Editor)));
+ }
+ 
+ void EditorNode::update_preview_themes(int p_mode) {
+@@ -789,6 +792,10 @@ void EditorNode::_notification(int p_what) {
+ 				recent_scenes->reset_size();
+ 			}
+ 
++			if (EditorSettings::get_singleton()->check_changed_settings_in_group("interface/editor/dock_tab_style")) {
++				editor_dock_manager->update_tab_styles();
++			}
++
+ 			if (EditorSettings::get_singleton()->check_changed_settings_in_group("interface/scene_tabs")) {
+ 				scene_tabs->update_scene_tabs();
+ 			}
+@@ -7040,22 +7047,22 @@ EditorNode::EditorNode() {
+ 	history_dock = memnew(HistoryDock);
+ 
+ 	// Scene: Top left.
+-	editor_dock_manager->add_dock(SceneTreeDock::get_singleton(), TTR("Scene"), EditorDockManager::DOCK_SLOT_LEFT_UR);
++	editor_dock_manager->add_dock(SceneTreeDock::get_singleton(), TTR("Scene"), EditorDockManager::DOCK_SLOT_LEFT_UR, nullptr, "PackedScene");
+ 
+ 	// Import: Top left, behind Scene.
+-	editor_dock_manager->add_dock(ImportDock::get_singleton(), TTR("Import"), EditorDockManager::DOCK_SLOT_LEFT_UR);
++	editor_dock_manager->add_dock(ImportDock::get_singleton(), TTR("Import"), EditorDockManager::DOCK_SLOT_LEFT_UR, nullptr, "FileAccess");
+ 
+ 	// FileSystem: Bottom left.
+-	editor_dock_manager->add_dock(FileSystemDock::get_singleton(), TTR("FileSystem"), EditorDockManager::DOCK_SLOT_LEFT_BR, ED_SHORTCUT_AND_COMMAND("bottom_panels/toggle_filesystem_bottom_panel", TTR("Toggle FileSystem Bottom Panel"), KeyModifierMask::ALT | Key::F));
++	editor_dock_manager->add_dock(FileSystemDock::get_singleton(), TTR("FileSystem"), EditorDockManager::DOCK_SLOT_LEFT_BR, ED_SHORTCUT_AND_COMMAND("bottom_panels/toggle_filesystem_bottom_panel", TTR("Toggle FileSystem Bottom Panel"), KeyModifierMask::ALT | Key::F), "Folder");
+ 
+ 	// Inspector: Full height right.
+-	editor_dock_manager->add_dock(InspectorDock::get_singleton(), TTR("Inspector"), EditorDockManager::DOCK_SLOT_RIGHT_UL);
++	editor_dock_manager->add_dock(InspectorDock::get_singleton(), TTR("Inspector"), EditorDockManager::DOCK_SLOT_RIGHT_UL, nullptr, "AnimationTrackList");
+ 
+ 	// Node: Full height right, behind Inspector.
+-	editor_dock_manager->add_dock(NodeDock::get_singleton(), TTR("Node"), EditorDockManager::DOCK_SLOT_RIGHT_UL);
++	editor_dock_manager->add_dock(NodeDock::get_singleton(), TTR("Node"), EditorDockManager::DOCK_SLOT_RIGHT_UL, nullptr, "Object");
+ 
+ 	// History: Full height right, behind Node.
+-	editor_dock_manager->add_dock(history_dock, TTR("History"), EditorDockManager::DOCK_SLOT_RIGHT_UL);
++	editor_dock_manager->add_dock(history_dock, TTR("History"), EditorDockManager::DOCK_SLOT_RIGHT_UL, nullptr, "History");
+ 
+ 	// Add some offsets to left_r and main hsplits to make LEFT_R and RIGHT_L docks wider than minsize.
+ 	left_r_hsplit->set_split_offset(270 * EDSCALE);
+diff --git a/editor/editor_settings.cpp b/editor/editor_settings.cpp
+index 752b060513417..69ed1e7bb7d7a 100644
+--- a/editor/editor_settings.cpp
++++ b/editor/editor_settings.cpp
+@@ -400,6 +400,7 @@ void EditorSettings::_load_defaults(Ref<ConfigFile> p_extra_config) {
+ 
+ 	// Editor
+ 	EDITOR_SETTING(Variant::BOOL, PROPERTY_HINT_NONE, "interface/editor/localize_settings", true, "")
++	EDITOR_SETTING(Variant::INT, PROPERTY_HINT_ENUM, "interface/editor/dock_tab_style", 0, "Text Only,Icon Only,Text and Icon")
+ 	EDITOR_SETTING_USAGE(Variant::INT, PROPERTY_HINT_ENUM, "interface/editor/ui_layout_direction", 0, "Based on Application Locale,Left-to-Right,Right-to-Left,Based on System Locale", PROPERTY_USAGE_DEFAULT | PROPERTY_USAGE_RESTART_IF_CHANGED)
+ 
+ 	// Display what the Auto display scale setting effectively corresponds to.
+diff --git a/editor/plugins/editor_plugin.cpp b/editor/plugins/editor_plugin.cpp
+index f42a1555a2aa5..2b3c1873527ee 100644
+--- a/editor/plugins/editor_plugin.cpp
++++ b/editor/plugins/editor_plugin.cpp
+@@ -100,6 +100,11 @@ void EditorPlugin::remove_control_from_bottom_panel(Control *p_control) {
+ 	EditorNode::get_bottom_panel()->remove_item(p_control);
+ }
+ 
++void EditorPlugin::set_dock_tab_icon(Control *p_control, const Ref<Texture2D> &p_icon) {
++	ERR_FAIL_NULL(p_control);
++	EditorDockManager::get_singleton()->set_dock_tab_icon(p_control, p_icon);
++}
++
+ void EditorPlugin::add_control_to_container(CustomControlContainer p_location, Control *p_control) {
+ 	ERR_FAIL_NULL(p_control);
+ 
+@@ -565,6 +570,7 @@ void EditorPlugin::_bind_methods() {
+ 	ClassDB::bind_method(D_METHOD("remove_control_from_docks", "control"), &EditorPlugin::remove_control_from_docks);
+ 	ClassDB::bind_method(D_METHOD("remove_control_from_bottom_panel", "control"), &EditorPlugin::remove_control_from_bottom_panel);
+ 	ClassDB::bind_method(D_METHOD("remove_control_from_container", "container", "control"), &EditorPlugin::remove_control_from_container);
++	ClassDB::bind_method(D_METHOD("set_dock_tab_icon", "control", "icon"), &EditorPlugin::set_dock_tab_icon);
+ 	ClassDB::bind_method(D_METHOD("add_tool_menu_item", "name", "callable"), &EditorPlugin::add_tool_menu_item);
+ 	ClassDB::bind_method(D_METHOD("add_tool_submenu_item", "name", "submenu"), &EditorPlugin::add_tool_submenu_item);
+ 	ClassDB::bind_method(D_METHOD("remove_tool_menu_item", "name"), &EditorPlugin::remove_tool_menu_item);
+diff --git a/editor/plugins/editor_plugin.h b/editor/plugins/editor_plugin.h
+index f45a512b897dd..f6c4b35407c55 100644
+--- a/editor/plugins/editor_plugin.h
++++ b/editor/plugins/editor_plugin.h
+@@ -151,6 +151,8 @@ class EditorPlugin : public Node {
+ 	void remove_control_from_docks(Control *p_control);
+ 	void remove_control_from_bottom_panel(Control *p_control);
+ 
++	void set_dock_tab_icon(Control *p_control, const Ref<Texture2D> &p_icon);
++
+ 	void add_tool_menu_item(const String &p_name, const Callable &p_callable);
+ 	void add_tool_submenu_item(const String &p_name, PopupMenu *p_submenu);
+ 	void remove_tool_menu_item(const String &p_name);
